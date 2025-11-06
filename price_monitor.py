@@ -630,11 +630,12 @@ def send_telegram_alert(message: str, parse_mode: str = None) -> bool:
         return False
 
 
-def scan_category(category_url: str) -> Tuple[int, int, bool]:
+def scan_category(category_url: str) -> Tuple[int, int, int, bool]:
     """Scan a single category for products below threshold"""
     category_name = category_url.split('/')[-1] or 'unknown'
     logger.info(f"Scanning: {category_name}")
     
+    total_products = 0
     products_checked = 0
     products_found = 0
     had_errors = False
@@ -644,13 +645,15 @@ def scan_category(category_url: str) -> Tuple[int, int, bool]:
         
         for page_url in pages:
             products = parse_products(page_url)
+            total_products += len(products)
             
             # Keep only products within the price threshold
             max_price = config.get("max_price", 10.0)
             filtered_products = [p for p in products if p['price'] <= max_price]
             
             products_checked += len(filtered_products)
-            logger.debug(f"Found {len(products)} products, {len(filtered_products)} match price threshold")
+            if len(products) > 0:
+                logger.info(f"  └─ Found {len(products)} total, {len(filtered_products)} under {max_price} lei")
             
             for product in filtered_products:
                 product_id = f"{product['url']}_{product['price']}"
@@ -669,23 +672,24 @@ def scan_category(category_url: str) -> Tuple[int, int, bool]:
                     msg += f"*URL:* {product['url']}"
                     send_telegram_alert(msg, parse_mode='Markdown')
         
-        return products_checked, products_found, had_errors
+        return total_products, products_checked, products_found, had_errors
     
     except Exception as e:
         logger.error(f"Error scanning category {category_name}: {e}")
-        return products_checked, products_found, True
+        return total_products, products_checked, products_found, True
 
 
-def scan_website() -> Tuple[int, int, int]:
+def scan_website() -> Tuple[int, int, int, int]:
     """Scan entire website for products below threshold"""
     categories = get_all_categories(config.get("base_url", ""))
     
     if not categories:
         logger.error("No categories found!")
-        return 0, 0, 0
+        return 0, 0, 0, 0
     
     logger.info(f"Starting parallel scan of {len(categories)} categories with {config.get('parallel_workers', 3)} threads...")
     
+    total_products = 0
     total_checked = 0
     total_found = 0
     categories_with_errors = 0
@@ -697,7 +701,8 @@ def scan_website() -> Tuple[int, int, int]:
         for future in as_completed(future_to_category):
             completed += 1
             try:
-                checked, found, had_errors = future.result()
+                scanned, checked, found, had_errors = future.result()
+                total_products += scanned
                 total_checked += checked
                 total_found += found
                 if had_errors:
@@ -705,16 +710,16 @@ def scan_website() -> Tuple[int, int, int]:
                 
                 # Log progress periodically
                 if completed % 5 == 0:
-                    logger.info(f"Progress: {completed}/{len(categories)} categories ({total_checked} products checked)")
+                    logger.info(f"Progress: {completed}/{len(categories)} categories | Total: {total_products} products, {total_checked} under threshold")
             
             except Exception as e:
                 categories_with_errors += 1
                 logger.error(f"Thread execution error: {e}")
         
         # Final progress
-        logger.info(f"Progress: {completed}/{len(categories)} categories ({total_checked} products checked)")
+        logger.info(f"Progress: {completed}/{len(categories)} categories | Total: {total_products} products, {total_checked} under threshold")
     
-    return total_checked, total_found, categories_with_errors
+    return total_products, total_checked, total_found, categories_with_errors
 
 
 def main_loop():
@@ -737,24 +742,28 @@ def main_loop():
             logger.info("=" * 70)
             
             start_time = time.time()
-            total_checked, total_found, categories_with_errors = scan_website()
+            total_scanned, total_checked, total_found, categories_with_errors = scan_website()
             execution_time = time.time() - start_time
             
             save_seen_products()
             
-            logger.info(f"\nIteration #{iteration} Summary:")
-            logger.info(f"  - Products checked: {total_checked}")
-            logger.info(f"  - Products found (<= {config.get('max_price', 10.0)}): {total_found}")
-            logger.info(f"  - Categories with errors: {categories_with_errors}")
-            logger.info(f"  - Execution time: {execution_time:.2f} seconds")
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Iteration #{iteration} Summary:")
+            logger.info(f"  📦 Total products scanned: {total_scanned}")
+            logger.info(f"  💰 Products under {config.get('max_price', 10.0)} lei: {total_checked}")
+            logger.info(f"  🎯 New products found: {total_found}")
+            logger.info(f"  ⚠️  Categories with errors: {categories_with_errors}")
+            logger.info(f"  ⏱️  Execution time: {execution_time:.2f} seconds")
+            logger.info("=" * 70)
             
             # Send Telegram summary only if products found OR errors occurred
             if total_found > 0 or categories_with_errors > 0:
                 summary_msg = f"🔍 Scan #{iteration} Complete\n\n"
-                summary_msg += f"✅ Products checked: {total_checked}\n"
-                summary_msg += f"🎯 Found (<= {config.get('max_price', 10.0)}): {total_found}\n"
+                summary_msg += f"📦 Total scanned: {total_scanned}\n"
+                summary_msg += f"💰 Under {config.get('max_price', 10.0)} lei: {total_checked}\n"
+                summary_msg += f"🎯 New found: {total_found}\n"
                 if categories_with_errors > 0:
-                    summary_msg += f"⚠️ Categories with errors: {categories_with_errors}\n"
+                    summary_msg += f"⚠️ Errors: {categories_with_errors}\n"
                 summary_msg += f"⏱️ Time: {execution_time:.1f}s"
                 send_telegram_alert(summary_msg)
             
